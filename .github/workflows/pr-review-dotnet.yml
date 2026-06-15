@@ -1,0 +1,317 @@
+name: PR Review .NET V1
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "src/backend/**"
+      - "tests/backend/**"
+      - "**/*.sln"
+      - "**/*.csproj"
+      - ".github/workflows/pr-review-dotnet.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-review-dotnet-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-review:
+    name: .NET PR checks and review
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        id: restore
+        continue-on-error: true
+        run: dotnet restore src/backend/copilot-enterprise.sln
+
+      - name: Detect changed backend and test files
+        id: changes
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > changed_files.txt
+
+          changed_backend_count=$(grep -E '^src/backend/.*\.cs$' changed_files.txt | grep -Ev '/(bin|obj)/' | wc -l | tr -d ' ' || true)
+          changed_test_count=$(grep -E '^tests/backend/.*Tests\.cs$' changed_files.txt | wc -l | tr -d ' ' || true)
+
+          echo "changed_backend_count=$changed_backend_count" >> "$GITHUB_OUTPUT"
+          echo "changed_test_count=$changed_test_count" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce test files when backend code changes
+        id: tests_presence
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          backend_changes="${{ steps.changes.outputs.changed_backend_count }}"
+          test_changes="${{ steps.changes.outputs.changed_test_count }}"
+
+          if [ "${backend_changes:-0}" -gt 0 ] && [ "${test_changes:-0}" -eq 0 ]; then
+            echo "Backend .cs files changed but no backend test file (*Tests.cs) was changed in this PR."
+            exit 1
+          fi
+
+          echo "Test presence gate passed."
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: |
+          dotnet build src/backend/copilot-enterprise.sln \
+            --configuration Release \
+            --no-restore \
+            -warnaserror \
+            /p:TreatWarningsAsErrors=true \
+            /p:EnableNETAnalyzers=true \
+            /p:AnalysisLevel=latest \
+            /p:EnforceCodeStyleInBuild=true \
+            /p:GenerateDocumentationFile=true
+
+      - name: Enforce XML documentation comments on changed backend files
+        id: comments
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          failed=0
+
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] || continue
+
+            # Only validate files that expose public API surface.
+            if grep -Eq 'public[[:space:]]+(class|interface|record|enum|struct)|public[[:space:]].*\(' "$file"; then
+              # Require XML doc comments in files that contain public API.
+              if ! grep -Eq '^[[:space:]]*///[[:space:]]+' "$file"; then
+                echo "::error file=$file::Public API detected without XML documentation comments (///)."
+                failed=1
+              fi
+            fi
+          done < <(grep -E '^src/backend/.*\.cs$' changed_files.txt | grep -Ev '/(bin|obj)/' || true)
+
+          if [ "$failed" -ne 0 ]; then
+            echo "XML documentation comments gate failed."
+            exit 1
+          fi
+
+      - name: Test
+        id: test
+        continue-on-error: true
+        run: dotnet test src/backend/copilot-enterprise.sln --configuration Release --no-build --verbosity minimal
+
+      - name: Format check
+        id: format
+        continue-on-error: true
+        run: dotnet format src/backend/copilot-enterprise.sln --verify-no-changes --verbosity minimal
+
+      - name: Generate PR diff for AI review
+        id: pr_diff
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" > pr.diff
+
+      - name: Run AI review
+        id: ai_review
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          GH_MODELS_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const diff = fs.existsSync('pr.diff')
+              ? fs.readFileSync('pr.diff', 'utf8')
+              : '';
+
+            if (!diff.trim()) {
+              fs.writeFileSync('review.md', 'ℹ️ No se detectó diff para revisar.');
+              return;
+            }
+
+            if (!process.env.GH_MODELS_TOKEN) {
+              fs.writeFileSync(
+                'review.md',
+                '⚠️ No se encontró `GH_MODELS_TOKEN` en secrets. Configura este secret para habilitar la revisión IA.'
+              );
+              return;
+            }
+
+            const maxDiffChars = 120000;
+            const safeDiff = diff.length > maxDiffChars
+              ? `${diff.slice(0, maxDiffChars)}\n\n[Diff truncado por tamaño]`
+              : diff;
+
+            const prompt = [
+              'Eres un revisor senior de .NET/C#.',
+              'Revisa el diff y reporta: bugs, riesgos de seguridad, malas prácticas, deuda técnica y mejoras.',
+              'Responde en Markdown con secciones:',
+              '1) Resumen',
+              '2) Hallazgos críticos',
+              '3) Hallazgos importantes',
+              '4) Sugerencias de mejora',
+              '5) Riesgo global (Bajo/Medio/Alto)',
+              'Incluye archivo y línea cuando sea posible.',
+              '',
+              'Diff:',
+              safeDiff,
+            ].join('\n');
+
+            const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.GH_MODELS_TOKEN}`,
+              },
+              body: JSON.stringify({
+                model: 'gpt-4.1-mini',
+                temperature: 0.2,
+                messages: [
+                  { role: 'system', content: 'You are an expert .NET code reviewer.' },
+                  { role: 'user', content: prompt },
+                ],
+              }),
+            });
+
+            if (!response.ok) {
+              const text = await response.text();
+              fs.writeFileSync('review.md', `⚠️ Error en revisión IA (${response.status}):\n\n${text}`);
+              return;
+            }
+
+            const data = await response.json();
+            const aiText = data?.choices?.[0]?.message?.content?.trim();
+
+            fs.writeFileSync(
+              'review.md',
+              aiText || 'ℹ️ La IA no devolvió contenido para esta revisión.'
+            );
+
+      - name: Comment AI review on PR
+        id: ai_comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.existsSync('review.md')
+              ? fs.readFileSync('review.md', 'utf8')
+              : 'No se generó revisión IA.';
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🤖 Revisión IA del diff\n\n${body}`,
+            });
+
+      - name: Publish PR review
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          RESTORE_RESULT: ${{ steps.restore.outcome }}
+          CHANGES_RESULT: ${{ steps.changes.outcome }}
+          TESTS_PRESENCE_RESULT: ${{ steps.tests_presence.outcome }}
+          BUILD_RESULT: ${{ steps.build.outcome }}
+          COMMENTS_RESULT: ${{ steps.comments.outcome }}
+          TEST_RESULT: ${{ steps.test.outcome }}
+          FORMAT_RESULT: ${{ steps.format.outcome }}
+          PR_DIFF_RESULT: ${{ steps.pr_diff.outcome }}
+          AI_REVIEW_RESULT: ${{ steps.ai_review.outcome }}
+          AI_COMMENT_RESULT: ${{ steps.ai_comment.outcome }}
+          CHANGED_BACKEND_COUNT: ${{ steps.changes.outputs.changed_backend_count }}
+          CHANGED_TEST_COUNT: ${{ steps.changes.outputs.changed_test_count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const outcomes = {
+              restore: process.env.RESTORE_RESULT,
+              changes: process.env.CHANGES_RESULT,
+              testsPresence: process.env.TESTS_PRESENCE_RESULT,
+              build: process.env.BUILD_RESULT,
+              comments: process.env.COMMENTS_RESULT,
+              test: process.env.TEST_RESULT,
+              format: process.env.FORMAT_RESULT,
+              prDiff: process.env.PR_DIFF_RESULT,
+              aiReview: process.env.AI_REVIEW_RESULT,
+              aiComment: process.env.AI_COMMENT_RESULT,
+            };
+
+            const emoji = (result) => result === 'success' ? '✅' : (result === 'failure' ? '❌' : '⚠️');
+            const allPassed = Object.values(outcomes).every((x) => x === 'success');
+
+            const body = [
+              '## 🤖 Revisión automática .NET del PR',
+              '',
+              `- ${emoji(outcomes.restore)} Restore: **${outcomes.restore}**`,
+              `- ${emoji(outcomes.changes)} Scan changes: **${outcomes.changes}**`,
+              `- ${emoji(outcomes.testsPresence)} Tests required gate: **${outcomes.testsPresence}**`,
+              `- ${emoji(outcomes.build)} Build: **${outcomes.build}**`,
+              `- ${emoji(outcomes.comments)} XML comments gate: **${outcomes.comments}**`,
+              `- ${emoji(outcomes.test)} Test: **${outcomes.test}**`,
+              `- ${emoji(outcomes.format)} Format: **${outcomes.format}**`,
+              `- ${emoji(outcomes.prDiff)} Generate PR diff: **${outcomes.prDiff}**`,
+              `- ${emoji(outcomes.aiReview)} AI review: **${outcomes.aiReview}**`,
+              `- ${emoji(outcomes.aiComment)} AI comment: **${outcomes.aiComment}**`,
+              '',
+              `- Changed backend .cs files: **${process.env.CHANGED_BACKEND_COUNT || '0'}**`,
+              `- Changed backend test files (*Tests.cs): **${process.env.CHANGED_TEST_COUNT || '0'}**`,
+              '',
+              allPassed
+                ? '✅ El PR pasó los checks de calidad .NET (buenas prácticas, comentarios y tests).'
+                : '❌ El PR tiene fallos en uno o más checks de calidad .NET. Revisa los logs para corregirlos.',
+              '',
+              `🔎 Logs: ${process.env.RUN_URL}`,
+            ].join('\n');
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'COMMENT',
+              body,
+            });
+
+      - name: Fail if any check failed
+        if: always()
+        run: |
+          failed=0
+          [ "${{ steps.restore.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.changes.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.tests_presence.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.build.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.comments.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.test.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.format.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.pr_diff.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.ai_review.outcome }}" = "success" ] || failed=1
+          [ "${{ steps.ai_comment.outcome }}" = "success" ] || failed=1
+
+          if [ "$failed" -ne 0 ]; then
+            echo "One or more .NET PR checks failed."
+            exit 1
+          fi

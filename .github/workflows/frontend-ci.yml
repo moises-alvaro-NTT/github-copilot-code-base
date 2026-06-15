@@ -1,0 +1,71 @@
+name: Frontend CI
+
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - "src/frontend/**"
+      - "package.json"
+      - "package-lock.json"
+      - "pnpm-lock.yaml"
+      - "yarn.lock"
+      - ".github/workflows/frontend-ci.yml"
+  push:
+    branches: ["main", "master"]
+    paths:
+      - "frontend/**"
+      - "src/frontend/**"
+      - "package.json"
+      - "package-lock.json"
+      - "pnpm-lock.yaml"
+      - "yarn.lock"
+      - ".github/workflows/frontend-ci.yml"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+            src/frontend/package-lock.json
+
+      - name: Install, lint, test, build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_DIR=""
+          if [ -f "frontend/package.json" ]; then
+            APP_DIR="frontend"
+          elif [ -f "src/frontend/package.json" ]; then
+            APP_DIR="src/frontend"
+          elif [ -f "package.json" ]; then
+            APP_DIR="."
+          fi
+
+          if [ -z "$APP_DIR" ]; then
+            echo "No frontend package.json found. Skipping frontend checks."
+            exit 0
+          fi
+
+          cd "$APP_DIR"
+
+          if [ -f "package-lock.json" ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+          npm run lint --if-present
+          npm run test --if-present
+          npm run build --if-present
